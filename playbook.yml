@@ -1,0 +1,424 @@
+---
+# Play 1/3: create new safe user
+- hosts: all
+  gather_facts: false
+  become: true
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: Create user deploy
+      ansible.builtin.user:
+        name: "{{ deploy_user }}"
+        password: "{{ deploy_user_password }}"
+        groups:
+          - sudo
+          - users
+        append: true
+        state: present
+        create_home: true
+        shell: /bin/bash
+
+    - name: Ensure /etc/sudoers.d directory exists
+      ansible.builtin.file:
+        path: /etc/sudoers.d
+        state: directory
+        mode: '0755'
+
+    - name: Create sudoers file for deploy user
+      ansible.builtin.file:
+        path: /etc/sudoers.d/{{ deploy_user }}
+        state: touch
+        mode: '0440'
+
+    - name: Grant deploy user no password sudo access
+      ansible.builtin.lineinfile:
+        path: /etc/sudoers.d/{{ deploy_user }}
+        line: '{{ deploy_user }} ALL=(ALL) NOPASSWD:ALL'
+      notify:
+        - Validate sudoers
+    
+    - name: Ensure .ssh directory exists for deploy user
+      ansible.builtin.file:
+        path: /home/{{ deploy_user }}/.ssh
+        state: directory
+        mode: '0700'
+        owner:  "{{ deploy_user }}"
+        group: "{{ deploy_user }}"
+
+    - name: Copy ansible SSH key for deploy user
+      block:
+        - name: Get SSH key
+          ansible.builtin.slurp:
+            src: "/home/debian/.ssh/authorized_keys"
+          register: ansible_ssh_key
+
+        - name: Add ssh key
+          ansible.builtin.lineinfile:
+            path: /home/{{ deploy_user }}/.ssh/authorized_keys
+            line: "{{ ansible_ssh_key.content | b64decode }}"
+            state: present
+            mode: '0600'
+            owner:  "{{ deploy_user }}"
+            group: "{{ deploy_user }}"
+            create: true
+
+  handlers:
+    - name: Validate sudoers
+      command: visudo -cf /etc/sudoers.d/{{ deploy_user }}
+
+# Play 2/3: switch user
+- hosts: all
+  gather_facts: false
+  vars_files:
+    - vars.yml
+  tasks:
+    - name: Update inventory file
+      delegate_to: localhost
+      ansible.builtin.lineinfile:
+        path: inventory.ini
+        regexp: '^ansible_user=debian$'
+        line: "ansible_user={{ deploy_user }}"
+        backrefs: true
+        state: present
+
+    - name: Switch user for safety
+      block:
+        - name: switch user | Set new ansible_user
+          ansible.builtin.set_fact:
+            ansible_user: "{{ deploy_user }}"
+            cacheable: true
+
+        - name: switch user | Reset connection
+          meta: reset_connection
+
+    - name: whoami 
+      no_log: true
+      command: whoami
+      register: whoami
+
+    - name: Assert whoami is deploy_user
+      assert:
+        that: whoami.stdout == "{{ deploy_user }}"
+        fail_msg: "Whoami output is not the expected user. Expected: {{ deploy_user }}, Got: {{ whoami.stdout }}"   
+        success_msg: "You logged as new user {{ deploy_user }}."
+
+# Play 3/3: configure server
+- hosts: all
+  become: true
+  gather_facts: true 
+  vars_files:
+    - vars/vars.yml
+    - vars/packages.yml  
+  tasks:
+    - name: Delete default debian user
+      ansible.builtin.user:
+        name: debian
+        state: absent
+
+    - name: Copy SSH keys for deploy user
+      block:
+        - name: dev SSH | Copy private key to server
+          ansible.builtin.copy:
+            src: ./files/dev_id_rsa
+            dest: /home/{{ deploy_user }}/.ssh/id_rsa
+            mode: '0600'
+            owner: "{{ deploy_user }}"
+            group: "{{ deploy_user }}"
+        - name: dev SSH | Copy public key to server
+          ansible.builtin.copy:
+            src: files/dev_id_rsa.pub
+            dest: /home/{{ deploy_user }}/.ssh/id_rsa.pub
+            owner: "{{ deploy_user }}"
+            group: "{{ deploy_user }}"
+            mode: '0644'
+        - name: dev SSH | Append key to autorized_keys
+          ansible.builtin.lineinfile:
+            path: /home/{{ deploy_user }}/.ssh/authorized_keys
+            line: "{{ lookup('file', 'files/dev_id_rsa.pub') }}"
+            owner: "{{ deploy_user }}"
+            group: "{{ deploy_user }}"
+            mode: '0600'
+            state: present
+            create: true
+
+    - name:  Set UTC+0 timezone
+      ansible.builtin.timezone:
+        name: UTC
+
+    - name: Apt update
+      ansible.builtin.apt:
+        update_cache: true
+        upgrade: true
+
+    - name: Add buster repo to get some packages
+      ansible.builtin.apt_repository:
+        repo: 'deb http://deb.debian.org/debian/ buster main'
+        state: present
+        update_cache: true
+    
+    - name: Install old packages
+      vars:
+        old_packages:
+          - python-minimal
+      block:
+        - name: old packages | Build dependencies
+          ansible.builtin.apt:
+            name: "{{ old_packages }}"
+            state: build-dep
+
+    - name: Install prerequisites
+      ansible.builtin.apt:
+        name: "{{ packages }}"
+        state: present
+
+    - name: Install Nginx
+      block:
+      - name: nginx | Add signing key
+        ansible.builtin.apt_key:
+          url: "{{ nginx_key_url }}"
+
+      - name: nginx | Add apt repository
+        ansible.builtin.apt_repository:
+          repo: "{{ nginx_repo }}"
+          state: present
+          filename: nginx
+          update_cache: true
+
+      - name: nginx | Install package
+        ansible.builtin.apt:
+          name: nginx
+          state: latest
+
+      - name: nginx | Update configuration
+        ansible.builtin.copy:
+          src: files/nginx.conf_
+          dest: /etc/nginx/nginx.conf
+          mode: '0644'
+          backup: true
+        notify: Start nginx
+
+    - name: Install MySQL {{ mysql_version }}
+      block:
+        - name: mysql | Add apt key
+          ansible.builtin.apt_key:
+            keyserver: pgp.mit.edu
+            id: A8D3785C
+            state: present
+
+        - name: mysql | Add apt repository
+          ansible.builtin.apt_repository:
+            repo: deb http://repo.mysql.com/apt/debian/ buster mysql-{{ mysql_version }}
+            filename: mysql
+            state: present
+            update_cache: true
+
+        - name: mysql | Install mysql-server
+          ansible.builtin.apt:
+            name: mysql-server={{ mysql_version }}*
+            state: present
+
+        - name: mysql | Check MySQL service started and enabled
+          service:
+            name: mysql
+            state: restarted
+            enabled: true
+          register: mysql_status
+        
+        - name: mysql | Run mysql secure installation
+          # In order to follow simlest instructions for safe installation
+          # I decided not to use community.mysql collection
+          # to avoid installing additional dependencies
+          ansible.builtin.expect:
+            command: mysql_secure_installation
+            responses:
+              "Would you like to setup VALIDATE PASSWORD plugin?": "n"
+              "Enter password for user root": "  "
+              "Change the root password":  "y"
+              "New password": "{{ mysql_root_password }}"
+              "Re-enter new password": "{{ mysql_root_password }}" 
+              "Remove anonymous users": "y"
+              "Disallow root login remotely": "y"
+              "Remove test database and access to it": "y"
+              "Reload privilege tables now": "y"
+          when: mysql_status.changed
+          register: secure_install_status
+          args:
+            creates: /.mysql_secure_installation.succeeded
+
+    - name: Build python from source
+      block:
+        - name: python | Download
+          ansible.builtin.get_url:
+            url: https://www.python.org/ftp/python/{{ python_version }}/Python-{{ python_version }}.tgz
+            dest: /home/{{ deploy_user }}/Python-{{ python_version }}.tgz
+            owner: "{{ deploy_user }}"
+            group: "{{ deploy_user }}"
+            mode: '0644'
+
+        - name: python | Extract
+          ansible.builtin.unarchive:
+            src: /home/{{ deploy_user }}/Python-{{ python_version }}.tgz
+            dest: /home/{{ deploy_user }}
+            owner: "{{ deploy_user }}"
+            group: "{{ deploy_user }}"
+            remote_src: true
+          args:
+            creates: "{{ python_build_dir }}"
+
+        - name: python | Configure and build
+          command:
+            cmd: ./configure --prefix=/opt/python3
+          args:
+            chdir: "{{ python_build_dir }}"
+            creates: /opt/python3/bin/python3
+
+        - name: python | Make
+          command:
+            cmd: make
+          args:
+            chdir: "{{ python_build_dir }}"
+            creates: /opt/python3/bin/python3
+
+        - name: python | Install
+          command:
+            cmd: make install
+          args:
+            chdir: "{{ python_build_dir }}"
+            creates: /opt/python3/bin/python3
+        
+        - name: Install pip using apt
+          ansible.builtin.apt:
+            name: python3-venv
+            state: present
+
+        - name: python | Create virtual environment
+          command: 
+            cmd: python3 -m venv {{ venv_path }}
+          args:
+            creates: "{{ venv_path }}"
+                
+        - name: python | Upgrade pip
+          become: true
+          ansible.builtin.pip:
+            name: pip
+            state: latest
+            executable: "{{ venv_path }}/bin/pip"
+
+        - name: python | Install required python packages
+          ansible.builtin.pip:
+            name:
+              - pycurl
+              - mysqlclient
+              - mysql-connector-python
+              - certifi
+              - redis
+              - sentry-sdk
+            state: present
+            executable: "{{ venv_path }}/bin/pip"
+    
+    - name: Gather package facts
+      package_facts:
+        manager: auto
+    
+    - name: Install composer
+      block:
+        - name: composer | Download
+          ansible.builtin.get_url:
+            url: "https://getcomposer.org/installer"
+            dest: "/tmp/composer-setup.php"
+            checksum: sha384:dac665fdc30fdd8ec78b38b9800061b4150413ff2e3b6f88543c636f7cd84f6db9189d43a81e5503cda447da73c7e5b6
+
+        - name: composer | Install
+          command: php /tmp/composer-setup.php --install-dir=/usr/local/bin/ --filename=composer
+          args:
+            creates: "/usr/local/bin/composer"
+      when: '"composer" not in ansible_facts.packages'
+    
+    - name: Ensure net.ipv4.ip_local_port_range is set
+      ansible.builtin.blockinfile:
+        path: /etc/sysctl.d/99-highload.conf
+        block: |
+          net.ipv4.ip_local_port_range = "{{ ip_local_port_range }}"
+          fs.nr_open = {{ fs_nr_open }}
+          fs.file-max = {{ fs_file_max }}
+        state: present
+        create: true
+    
+    - name: Apply kernel settings
+      command: sysctl -p /etc/sysctl.d/99-highload.conf
+
+    - name: Set DefaultLimitNOFILE
+      ansible.builtin.lineinfile:
+        path: /etc/systemd/system.conf
+        regexp: '&#?DefaultLimitNOFILE'
+        backrefs: true
+        line: 'DefaultLimitNOFILE={{ DefaultLimitNOFILE }}'
+        state: present
+        
+    - name: Set users' fileno limits
+      block:
+        - name: root file descriptors limits | Set hard and soft limit
+          ansible.builtin.blockinfile:
+            path: /etc/security/limits.conf
+            block: |
+              root hard nofile 6500536
+              root soft nofile 6500535
+            state: present
+        
+        - name: wildcard file descriptors limits | Set hard and soft limit
+          ansible.builtin.blockinfile:
+            path: /etc/security/limits.conf
+            block: |
+              * hard nofile 40000000
+              * soft nofile 40000000
+            state: present
+        
+    - name: Create project structure
+      become: true
+      block:
+        - name: Create /etc/nginx/projects_conf
+          ansible.builtin.file:
+            path: /etc/nginx/projects_conf
+            state: directory
+            
+        - name: Create /etc/nginx/projects/panels
+          ansible.builtin.file:
+            path: /etc/nginx/projects/panels
+            state: directory
+            owner: "{{ deploy_user }}"
+            group: "{{ deploy_user }}"
+            mode: '0777'
+            recurse: true
+
+        - name: Create GeoIP shared runtime
+          ansible.builtin.file:
+            path: /var/www/server/frontend/shared/runtime/GeoIP
+            state: directory
+        
+    - name: Setup logrotate for nginx
+      ansible.builtin.copy:
+        src: files/logrotate.conf_
+        dest: /etc/logrotate.d/nginx
+        mode: '0644'
+      notify: Reload logrotate
+      
+  post_tasks:
+    - name: Reboot the machine
+      ansible.builtin.reboot:
+        connect_timeout: 10
+
+  handlers:
+    - name: Start nginx
+      service:
+        name: nginx
+        enabled: true
+        state: started
+
+    - name: Start mysql-server
+      service:
+        name: mysql
+        enabled: true
+        state: started
+
+    - name: Reload logrotate
+      command: logrotate -f /etc/logrotate.conf

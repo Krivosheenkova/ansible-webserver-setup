@@ -1,0 +1,17 @@
+deploy_user: deploy
+deploy_user_password: '$1$fPr0S.s7$FusGi2GAenfYDUk1SJ1tu0'
+
+ip_local_port_range: "1024 65535"
+fs_nr_open: 2000000
+fs_file_max: 5000000
+DefaultLimitNOFILE: 6500535
+
+nginx_repo: "deb http://nginx.org/packages/debian {{ ansible_distribution_release }} nginx"
+nginx_key_url: "https://nginx.org/keys/nginx_signing.key"
+
+mysql_version: "5.7"
+mysql_root_password: '12345678'
+
+python_version: "3.9.6"
+python_build_dir: /home/{{ deploy_user }}/Python-{{ python_version }}
+venv_path: /home/{{ deploy_user }}/.project-venv
